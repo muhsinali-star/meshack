@@ -1,53 +1,87 @@
 import os
-from flask import Flask, render_template_string, request, redirect
+import base64
 import sqlite3
-import google.generativeai as genai
+from flask import Flask, render_template_string, request, send_file, flash, redirect
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from werkzeug.utils import secure_filename
+import io
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)
+UPLOAD_FOLDER = '/tmp/uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# --- Setup Gemini ---
-# We will set the API Key in the Render Dashboard later for security
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
-model = genai.GenerativeModel('gemini-1.5-flash')
+# --- Encryption Logic ---
+def get_key(password: str):
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32,
+        salt=b'static_salt_secure', iterations=100000,
+    )
+    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
-# --- Database Setup ---
+# --- Database ---
 def init_db():
-    conn = sqlite3.connect('database.db')
+    conn = sqlite3.connect('/tmp/vault.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS messages 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT, content TEXT)''')
+                 (id TEXT PRIMARY KEY, encrypted_body TEXT, filename TEXT, encrypted_file BLOB)''')
     conn.commit()
     conn.close()
 
-# --- HTML Design ---
+# --- Modern UI ---
 HTML = '''
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>AI Secret Message</title>
+    <meta charset="UTF-8">
+    <title>Vault v2.0 | Secure A-to-B</title>
     <style>
-        body { font-family: sans-serif; background: #121212; color: white; display: flex; justify-content: center; padding: 40px; }
-        .card { background: #1e1e1e; padding: 25px; border-radius: 12px; width: 100%; max-width: 450px; border: 1px solid #333; }
-        input, textarea { width: 100%; margin: 10px 0; padding: 12px; background: #2d2d2d; border: 1px solid #444; color: white; border-radius: 6px; box-sizing: border-box; }
-        button { width: 100%; padding: 12px; background: #3d5afe; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
-        .msg-list { margin-top: 20px; border-top: 1px solid #333; padding-top: 10px; }
+        :root { --bg: #0f172a; --card: #1e293b; --accent: #38bdf8; --text: #f1f5f9; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); display: flex; justify-content: center; padding: 40px; }
+        .container { background: var(--card); padding: 2rem; border-radius: 16px; width: 100%; max-width: 500px; box-shadow: 0 10px 25px rgba(0,0,0,0.3); border: 1px solid #334155; }
+        h1 { font-size: 1.5rem; text-align: center; color: var(--accent); margin-bottom: 1.5rem; }
+        input, textarea { width: 100%; padding: 12px; margin: 8px 0; background: #0f172a; border: 1px solid #334155; border-radius: 8px; color: white; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: var(--accent); border: none; border-radius: 8px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        button:hover { opacity: 0.9; transform: translateY(-1px); }
+        .tab-btn { background: #334155; margin-bottom: 20px; }
+        .result-box { margin-top: 20px; padding: 15px; background: #0f172a; border-radius: 8px; border-left: 4px solid var(--accent); }
     </style>
 </head>
 <body>
-    <div class="card">
-        <h2>🤖 Ask Gemini & Save</h2>
-        <form method="POST" action="/ask">
-            <input type="text" name="subject" placeholder="Topic (e.g., Coding Help)" required>
-            <textarea name="prompt" placeholder="Ask Gemini something..." required></textarea>
-            <button type="submit">Ask AI & Save to DB</button>
+    <div class="container">
+        <h1>🔒 Vault v2.0</h1>
+        
+        <form method="POST" action="/send" enctype="multipart/form-data">
+            <input type="text" name="subject" placeholder="Subject (Will be your ID)" required>
+            <textarea name="message" placeholder="Type secret message..." required></textarea>
+            <div style="font-size: 0.8rem; margin: 5px 0;">📎 Attach Secret File:</div>
+            <input type="file" name="file">
+            <input type="password" name="password" placeholder="Encryption Password" required>
+            <button type="submit">Encrypt & Send</button>
         </form>
 
-        <div class="msg-list">
-            <h3>Saved Responses</h3>
-            {% for m in msgs %}
-                <p><strong>{{ m[1] }}:</strong> {{ m[2][:100] }}...</p>
-            {% endfor %}
-        </div>
+        <hr style="border: 0; border-top: 1px solid #334155; margin: 2rem 0;">
+
+        <form method="POST" action="/read">
+            <input type="text" name="msg_id" placeholder="Enter Subject/ID" required>
+            <input type="password" name="password" placeholder="Enter Password" required>
+            <button type="submit" class="tab-btn">Unlock & Download</button>
+        </form>
+
+        {% if data %}
+            <div class="result-box">
+                <strong>Message:</strong><p>{{ data.msg }}</p>
+                {% if data.file %}
+                <form action="/download" method="POST">
+                    <input type="hidden" name="msg_id" value="{{ data.id }}">
+                    <input type="hidden" name="password" value="{{ data.pw }}">
+                    <button type="submit" style="background: #10b981;">⬇️ Download Decrypted File</button>
+                </form>
+                {% endif %}
+            </div>
+        {% endif %}
     </div>
 </body>
 </html>
@@ -55,29 +89,67 @@ HTML = '''
 
 @app.route('/')
 def home():
-    conn = sqlite3.connect('database.db')
-    c = conn.cursor()
-    c.execute("SELECT * FROM messages ORDER BY id DESC LIMIT 5")
-    msgs = c.fetchall()
-    conn.close()
-    return render_template_string(HTML, msgs=msgs)
+    return render_template_string(HTML)
 
-@app.route('/ask', methods=['POST'])
-def ask():
-    subject = request.form['subject']
-    prompt = request.form['prompt']
+@app.route('/send', methods=['POST'])
+def send():
+    subject = secure_filename(request.form['subject'])
+    msg = request.form['message']
+    pw = request.form['password']
+    file = request.files.get('file')
     
-    # Get response from Gemini
-    response = model.generate_content(prompt)
+    fernet = Fernet(get_key(pw))
+    enc_msg = fernet.encrypt(msg.encode()).decode()
     
-    # Save to SQLite
-    conn = sqlite3.connect('database.db')
+    enc_file_data = None
+    filename = None
+    if file and file.filename != '':
+        filename = secure_filename(file.filename)
+        enc_file_data = fernet.encrypt(file.read())
+
+    conn = sqlite3.connect('/tmp/vault.db')
     c = conn.cursor()
-    c.execute("INSERT INTO messages (subject, content) VALUES (?, ?)", (subject, response.text))
+    c.execute("INSERT OR REPLACE INTO messages VALUES (?, ?, ?, ?)", (subject, enc_msg, filename, enc_file_data))
     conn.commit()
     conn.close()
+    return f"Success! Tell Person B to search for Subject: <b>{subject}</b> <a href='/'>Back</a>"
+
+@app.route('/read', methods=['POST'])
+def read():
+    msg_id = request.form['msg_id']
+    pw = request.form['password']
     
-    return redirect('/')
+    conn = sqlite3.connect('/tmp/vault.db')
+    c = conn.cursor()
+    c.execute("SELECT encrypted_body, filename FROM messages WHERE id=?", (msg_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if row:
+        try:
+            fernet = Fernet(get_key(pw))
+            dec_msg = fernet.decrypt(row[0].encode()).decode()
+            return render_template_string(HTML, data={'msg': dec_msg, 'file': row[1], 'id': msg_id, 'pw': pw})
+        except:
+            return "❌ Decryption failed. Wrong password."
+    return "❌ ID not found."
+
+@app.route('/download', methods=['POST'])
+def download():
+    msg_id = request.form['msg_id']
+    pw = request.form['password']
+    
+    conn = sqlite3.connect('/tmp/vault.db')
+    c = conn.cursor()
+    c.execute("SELECT filename, encrypted_file FROM messages WHERE id=?", (msg_id,))
+    row = c.fetchone()
+    conn.close()
+
+    if row and row[1]:
+        fernet = Fernet(get_key(pw))
+        dec_file = fernet.decrypt(row[1])
+        return send_file(io.BytesIO(dec_file), download_name=row[0], as_attachment=True)
+    return "File not found."
 
 if __name__ == '__main__':
     init_db()
